@@ -1,6 +1,6 @@
 #!/bin/bash
 # Bootstrap script for EC2 benchmark instances.
-# Installs Docker (+ Compose v2), Node.js 22, and signals readiness.
+# Installs Docker (+ Compose v2), Node.js 24, and signals readiness.
 set -euxo pipefail
 exec > /var/log/bench-init.log 2>&1
 
@@ -19,8 +19,8 @@ mkdir -p /usr/local/lib/docker/cli-plugins
 curl -SL "$COMPOSE_URL" -o /usr/local/lib/docker/cli-plugins/docker-compose
 chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 
-# ── Node.js 22 (NodeSource) ──────────────────────────────────────────
-curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
+# ── Node.js 24 (NodeSource) ──────────────────────────────────────────
+curl -fsSL https://rpm.nodesource.com/setup_24.x | bash -
 dnf install -y nodejs
 
 # ── Signal completion ─────────────────────────────────────────────────
