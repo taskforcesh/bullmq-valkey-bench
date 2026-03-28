@@ -63,7 +63,7 @@ on:
         type: string
       process_jobs:
         description: "Jobs for processing tests"
-        default: "10000"
+        default: "50000"
         type: string
       run_io_threads:
         description: "Also run io-threads=4 benchmark"

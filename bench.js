@@ -22,7 +22,7 @@
  * Environment:
  *   RUNS=5          Number of runs per test (default: 5)
  *   BULK_JOBS=50000 Jobs for bulk insert test
- *   PROCESS_JOBS=10000 Jobs for processing tests
+ *   PROCESS_JOBS=50000 Jobs for processing tests
  */
 
 import { Queue, Worker } from "bullmq";
@@ -39,7 +39,7 @@ const TARGETS = [
 
 const RUNS = parseInt(process.env.RUNS ?? "5", 10);
 const BULK_JOBS = parseInt(process.env.BULK_JOBS ?? "50000", 10);
-const PROCESS_JOBS = parseInt(process.env.PROCESS_JOBS ?? "10000", 10);
+const PROCESS_JOBS = parseInt(process.env.PROCESS_JOBS ?? "50000", 10);
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
