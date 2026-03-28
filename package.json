@@ -1,0 +1,14 @@
+{
+  "name": "bullmq-valkey-bench",
+  "version": "1.0.0",
+  "description": "Benchmark BullMQ across Valkey 7.2, 8.1, and 9.0",
+  "type": "module",
+  "scripts": {
+    "bench": "node bench.js",
+    "bench:mt": "node bench.js --io-threads"
+  },
+  "dependencies": {
+    "bullmq": "^5.67.0",
+    "ioredis": "^5.0.0"
+  }
+}

@@ -1,0 +1,128 @@
+# BullMQ Valkey Benchmark - Docker Compose
+# Runs Valkey 7.2, 8.1, and 9.0 simultaneously on different ports.
+#
+# Usage:
+#   docker compose up -d
+#   docker compose down -v   # cleanup
+#
+# Default config (single-threaded) - matches typical Redis usage.
+# For multi-threaded benchmarks, use the io-threads profile:
+#   docker compose --profile io-threads up -d
+
+services:
+  # ── Valkey 7.2 (baseline, single-threaded) ──────────────────────────
+  valkey-7:
+    image: valkey/valkey:7.2
+    container_name: valkey-7
+    ports:
+      - "6380:6379"
+    command: >
+      valkey-server
+      --save ""
+      --appendonly no
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Valkey 8.1 (new hash table, memory optimizations) ──────────────
+  valkey-8:
+    image: valkey/valkey:8.1
+    container_name: valkey-8
+    ports:
+      - "6381:6379"
+    command: >
+      valkey-server
+      --save ""
+      --appendonly no
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Valkey 9.0 (pipeline prefetch, zero-copy, SIMD) ────────────────
+  valkey-9:
+    image: valkey/valkey:9.0
+    container_name: valkey-9
+    ports:
+      - "6382:6379"
+    command: >
+      valkey-server
+      --save ""
+      --appendonly no
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Multi-threaded variants (io-threads=4) ──────────────────────────
+  # Activate with: docker compose --profile io-threads up -d
+
+  valkey-7-mt:
+    image: valkey/valkey:7.2
+    container_name: valkey-7-mt
+    profiles: ["io-threads"]
+    ports:
+      - "6390:6379"
+    command: >
+      valkey-server
+      --save ""
+      --appendonly no
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+      --io-threads 4
+      --io-threads-do-reads yes
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  valkey-8-mt:
+    image: valkey/valkey:8.1
+    container_name: valkey-8-mt
+    profiles: ["io-threads"]
+    ports:
+      - "6391:6379"
+    command: >
+      valkey-server
+      --save ""
+      --appendonly no
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+      --io-threads 4
+      --io-threads-do-reads yes
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  valkey-9-mt:
+    image: valkey/valkey:9.0
+    container_name: valkey-9-mt
+    profiles: ["io-threads"]
+    ports:
+      - "6392:6379"
+    command: >
+      valkey-server
+      --save ""
+      --appendonly no
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+      --io-threads 4
+      --io-threads-do-reads yes
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

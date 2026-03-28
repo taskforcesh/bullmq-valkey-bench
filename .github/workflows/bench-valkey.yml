@@ -1,0 +1,345 @@
+# ──────────────────────────────────────────────────────────────────────
+# Valkey Benchmark — GitHub Actions Workflow
+#
+# Provisions an EC2 instance, runs BullMQ benchmarks against
+# Valkey 7.2, 8.1, and 9.0, collects results, and tears everything
+# down. Designed for reproducible, production-representative numbers
+# on Linux/Intel hardware.
+#
+# Authentication: GitHub OIDC → AWS IAM Role (no long-lived secrets)
+#
+# Required GitHub Secret:
+#   AWS_BENCHMARK_ROLE_ARN  — ARN of the IAM role to assume
+#
+# IAM Role trust policy (replace OWNER/REPO):
+#   {
+#     "Version": "2012-10-17",
+#     "Statement": [{
+#       "Effect": "Allow",
+#       "Principal": {
+#         "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+#       },
+#       "Action": "sts:AssumeRoleWithWebIdentity",
+#       "Condition": {
+#         "StringEquals": {
+#           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+#         },
+#         "StringLike": {
+#           "token.actions.githubusercontent.com:sub": "repo:OWNER/REPO:*"
+#         }
+#       }
+#     }]
+#   }
+#
+# IAM Role permissions needed:
+#   ec2:RunInstances, ec2:TerminateInstances, ec2:DescribeInstances,
+#   ec2:DescribeVpcs, ec2:CreateTags,
+#   ec2:ImportKeyPair, ec2:DeleteKeyPair,
+#   ec2:CreateSecurityGroup, ec2:DeleteSecurityGroup,
+#   ec2:AuthorizeSecurityGroupIngress,
+#   ssm:GetParameters (for AMI lookup)
+# ──────────────────────────────────────────────────────────────────────
+
+name: Valkey Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_type:
+        description: "EC2 instance type"
+        default: "c6i.xlarge"
+        type: string
+      region:
+        description: "AWS region"
+        default: "us-east-1"
+        type: string
+      runs:
+        description: "Number of runs per test"
+        default: "5"
+        type: string
+      bulk_jobs:
+        description: "Jobs for bulk insert test"
+        default: "50000"
+        type: string
+      process_jobs:
+        description: "Jobs for processing tests"
+        default: "10000"
+        type: string
+      run_io_threads:
+        description: "Also run io-threads=4 benchmark"
+        default: true
+        type: boolean
+
+env:
+  KEY_NAME: bench-valkey-${{ github.run_id }}
+  SG_NAME: bench-valkey-${{ github.run_id }}
+  SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  benchmark:
+    name: Run Valkey Benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      # ── Setup ─────────────────────────────────────────────────────
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BENCHMARK_ROLE_ARN }}
+          aws-region: ${{ inputs.region }}
+
+      - name: Create ephemeral SSH key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keygen -t ed25519 -f ~/.ssh/bench-key -N "" -q
+          chmod 600 ~/.ssh/bench-key
+
+          aws ec2 import-key-pair \
+            --key-name "$KEY_NAME" \
+            --public-key-material fileb://~/.ssh/bench-key.pub
+
+      - name: Create security group
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters Name=isDefault,Values=true \
+            --query 'Vpcs[0].VpcId' --output text)
+
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name "$SG_NAME" \
+            --description "Ephemeral SG for BullMQ Valkey benchmark (run ${{ github.run_id }})" \
+            --vpc-id "$VPC_ID" \
+            --query 'GroupId' --output text)
+
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" \
+            --protocol tcp --port 22 --cidr 0.0.0.0/0
+
+          echo "SG_ID=$SG_ID" >> "$GITHUB_ENV"
+
+      # ── Provision ─────────────────────────────────────────────────
+
+      - name: Launch EC2 instance
+        run: |
+          # Resolve latest Amazon Linux 2023 AMI
+          AMI_ID=$(aws ssm get-parameters \
+            --names /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+            --query 'Parameters[0].Value' --output text)
+
+          echo "Using AMI: $AMI_ID"
+
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "$AMI_ID" \
+            --instance-type "${{ inputs.instance_type }}" \
+            --key-name "$KEY_NAME" \
+            --security-group-ids "$SG_ID" \
+            --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":20,"VolumeType":"gp3"}}]' \
+            --instance-initiated-shutdown-behavior terminate \
+            --user-data file://cloud-init.sh \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=bullmq-valkey-bench-${{ github.run_id }}}]" \
+            --query 'Instances[0].InstanceId' --output text)
+
+          echo "Instance: $INSTANCE_ID"
+          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
+          echo "AMI_ID=$AMI_ID" >> "$GITHUB_ENV"
+
+          # Wait for running state
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+
+          echo "Public IP: $PUBLIC_IP"
+          echo "PUBLIC_IP=$PUBLIC_IP" >> "$GITHUB_ENV"
+
+      - name: Wait for cloud-init
+        run: |
+          echo "Waiting for instance bootstrap to complete..."
+          for i in $(seq 1 36); do
+            if ssh $SSH_OPTS -i ~/.ssh/bench-key ec2-user@"$PUBLIC_IP" \
+              'test -f /tmp/cloud-init-done' 2>/dev/null; then
+              echo "Instance ready after ~$((i * 10))s"
+              break
+            fi
+            if [ "$i" -eq 36 ]; then
+              echo "::error::Cloud-init timed out after 360s"
+              exit 1
+            fi
+            echo "  attempt $i/36..."
+            sleep 10
+          done
+
+      # ── Benchmark ─────────────────────────────────────────────────
+
+      - name: Copy benchmark code
+        run: |
+          ssh $SSH_OPTS -i ~/.ssh/bench-key ec2-user@"$PUBLIC_IP" "mkdir -p ~/bench"
+          scp $SSH_OPTS -i ~/.ssh/bench-key \
+            bench.js docker-compose.yml package.json package-lock.json \
+            ec2-user@"$PUBLIC_IP":~/bench/
+
+      - name: Run single-threaded benchmark
+        run: |
+          ssh $SSH_OPTS -i ~/.ssh/bench-key ec2-user@"$PUBLIC_IP" "\
+            cd ~/bench && \
+            docker compose up -d --wait && \
+            npm ci --loglevel=warn && \
+            RUNS=${{ inputs.runs }} \
+            BULK_JOBS=${{ inputs.bulk_jobs }} \
+            PROCESS_JOBS=${{ inputs.process_jobs }} \
+            node bench.js"
+
+      - name: Run io-threads benchmark
+        if: inputs.run_io_threads
+        run: |
+          ssh $SSH_OPTS -i ~/.ssh/bench-key ec2-user@"$PUBLIC_IP" "\
+            cd ~/bench && \
+            docker compose --profile io-threads up -d --wait && \
+            RUNS=${{ inputs.runs }} \
+            BULK_JOBS=${{ inputs.bulk_jobs }} \
+            PROCESS_JOBS=${{ inputs.process_jobs }} \
+            node bench.js --io-threads"
+
+      # ── Collect results ───────────────────────────────────────────
+
+      - name: Capture system info
+        run: |
+          ssh $SSH_OPTS -i ~/.ssh/bench-key ec2-user@"$PUBLIC_IP" bash <<'REMOTE' > system-info.json
+          cat <<EOF
+          {
+            "instance_type": "${{ inputs.instance_type }}",
+            "region": "${{ inputs.region }}",
+            "ami": "${{ env.AMI_ID }}",
+            "kernel": "$(uname -r)",
+            "node": "$(node -v)",
+            "docker": "$(docker --version)",
+            "compose": "$(docker compose version --short)",
+            "cpu_model": "$(lscpu | grep 'Model name' | sed 's/.*: *//')",
+            "cpu_cores": $(nproc),
+            "memory_gb": $(awk '/MemTotal/{printf "%.1f", $2/1024/1024}' /proc/meminfo)
+          }
+          EOF
+          REMOTE
+
+      - name: Download results
+        run: |
+          scp $SSH_OPTS -i ~/.ssh/bench-key \
+            ec2-user@"$PUBLIC_IP":~/bench/results*.json ./
+
+      - name: Generate summary
+        run: |
+          python3 << 'PYSCRIPT'
+          import json, os
+
+          # Load data
+          with open("system-info.json") as f:
+              sys_info = json.load(f)
+          with open("results.json") as f:
+              st = json.load(f)
+          mt = {}
+          if os.path.exists("results-mt.json"):
+              with open("results-mt.json") as f:
+                  mt = json.load(f)
+
+          summary = []
+          summary.append("## Valkey Benchmark Results\n")
+          summary.append("### System")
+          summary.append(f"- **Instance:** {sys_info.get('instance_type', 'N/A')}")
+          summary.append(f"- **CPU:** {sys_info.get('cpu_model', 'N/A')} ({sys_info.get('cpu_cores', 'N/A')} cores)")
+          summary.append(f"- **Memory:** {sys_info.get('memory_gb', 'N/A')} GB")
+          summary.append(f"- **Region:** {sys_info.get('region', 'N/A')}")
+          summary.append(f"- **Node.js:** {sys_info.get('node', 'N/A')}")
+          summary.append(f"- **Kernel:** {sys_info.get('kernel', 'N/A')}")
+          summary.append("")
+
+          def fmt(v, unit="j/s"):
+              if unit == "ms":
+                  return f"{v:.3f} ms"
+              return f"{v:,.0f} {unit}"
+
+          def pct(old, new, lower_better=False):
+              if not old:
+                  return "—"
+              diff = ((old - new) / old * 100) if lower_better else ((new - old) / old * 100)
+              sign = "+" if diff > 0 else ""
+              if abs(diff) < 2:
+                  return "~same"
+              return f"{sign}{diff:.0f}%"
+
+          tests = [
+              ("PING latency",  "ping_ms",        "ms",  True),
+              ("Bulk Insert",   "bulk_insert",     "j/s", False),
+              ("Single Insert", "single_insert",   "j/s", False),
+              ("Overhead c=1",  "overhead_c1",     "j/s", False),
+              ("Overhead c=10", "overhead_c10",    "j/s", False),
+              ("Overhead c=50", "overhead_c50",    "j/s", False),
+              ("I/O c=10",      "io_c10",          "j/s", False),
+              ("I/O c=50",      "io_c50",          "j/s", False),
+              ("CPU c=10",      "cpu_c10",         "j/s", False),
+          ]
+
+          versions = ["Valkey 7.2", "Valkey 8.1", "Valkey 9.0"]
+
+          def render_table(title, data):
+              summary.append(f"### {title}\n")
+              summary.append(f"| Test | {' | '.join(versions)} | 7.2→9.0 |")
+              summary.append(f"|------|{'|'.join(['---'] * (len(versions) + 1))}|")
+              for label, key, unit, lower_better in tests:
+                  vals = [data.get(v, {}).get(key, 0) for v in versions]
+                  cells = [fmt(v, unit) for v in vals]
+                  change = pct(vals[0], vals[-1], lower_better)
+                  summary.append(f"| {label} | {' | '.join(cells)} | {change} |")
+              summary.append("")
+
+          render_table("Single-threaded (default)", st)
+          if mt:
+              render_table("Multi-threaded (io-threads=4)", mt)
+
+          text = "\n".join(summary)
+          print(text)
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(text + "\n")
+          PYSCRIPT
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: valkey-bench-${{ inputs.instance_type }}-${{ github.run_id }}
+          path: |
+            results.json
+            results-mt.json
+            system-info.json
+
+      # ── Cleanup (always) ──────────────────────────────────────────
+
+      - name: Terminate instance
+        if: always()
+        run: |
+          if [ -n "${INSTANCE_ID:-}" ]; then
+            echo "Terminating $INSTANCE_ID..."
+            aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" || true
+            aws ec2 wait instance-terminated --instance-ids "$INSTANCE_ID" || true
+          fi
+
+      - name: Delete key pair
+        if: always()
+        run: aws ec2 delete-key-pair --key-name "$KEY_NAME" 2>/dev/null || true
+
+      - name: Delete security group
+        if: always()
+        run: |
+          if [ -n "${SG_ID:-}" ]; then
+            # Instance ENI takes a moment to release after termination
+            sleep 15
+            aws ec2 delete-security-group --group-id "$SG_ID" 2>/dev/null || true
+          fi
