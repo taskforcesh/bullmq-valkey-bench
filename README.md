@@ -1,9 +1,18 @@
-# BullMQ Valkey Benchmark
+# BullMQ Valkey / PostgreSQL Benchmark
 
-Benchmarks BullMQ (Node.js) across Valkey 7.2, 8.1, and 9.0 to measure
-how server-side improvements affect job queue throughput.
+Benchmarks BullMQ (Node.js) across two suites:
+
+- **`valkey`** (default) — Valkey 7.2, 8.1, and 9.0 over the Redis protocol,
+  measuring how server-side improvements affect job-queue throughput.
+- **`pg`** — the **BullMQ v6 PostgreSQL backend** (durable, and with
+  `synchronous_commit=off`) compared against **Redis**, on identical hardware.
+
+The same `bench.js` harness runs both; a `target` abstraction hides whether the
+backend is Redis or PostgreSQL, so every test body is identical.
 
 ## Quick Start (Local)
+
+### Valkey suite (default)
 
 ```bash
 # 1. Start all three Valkey versions
@@ -23,11 +32,38 @@ node bench.js --io-threads
 docker compose --profile io-threads down -v
 ```
 
+### PostgreSQL vs Redis suite (BullMQ v6)
+
+```bash
+# 1. Start Redis + PostgreSQL (durable) + PostgreSQL (synchronous_commit=off)
+docker compose --profile pg up -d --wait
+
+# 2. Install dependencies (pulls in bullmq v6 and the pg driver)
+npm install
+
+# 3. Run the PostgreSQL vs Redis comparison
+npm run bench:pg          # or: node bench.js --suite=pg
+
+# 4. Cleanup
+docker compose --profile pg down -v
+```
+
+Requires **BullMQ v6+** (PostgreSQL backend) and the **`pg`** peer dependency —
+both are declared in `package.json`.
+
 ## Running on AWS (GitHub Actions)
 
-For reproducible, production-representative results on Linux/Intel hardware,
-use the GitHub Actions workflow. It provisions an ephemeral EC2 instance,
-runs all benchmarks, and tears everything down automatically.
+For reproducible, production-representative results on real EC2 hardware, use the
+GitHub Actions workflows. Each provisions an ephemeral EC2 instance, runs the
+benchmark, downloads results, renders a Job Summary, and tears everything down
+automatically (even on failure).
+
+- **Valkey Benchmark** (`.github/workflows/bench-valkey.yml`) — Valkey 7.2/8.1/9.0.
+- **PostgreSQL vs Redis Benchmark** (`.github/workflows/bench-postgres.yml`) —
+  the v6 PostgreSQL backend vs Redis. Uses the `pg` docker-compose profile and
+  runs `node bench.js --suite=pg`.
+
+Both share the same AWS/OIDC setup below.
 
 ### Setup
 
@@ -96,17 +132,32 @@ is terminated automatically even if the workflow fails.
 
 ## Port Map
 
+### Valkey suite
+
 | Version     | Default Port | io-threads Port |
 |-------------|-------------|-----------------|
 | Valkey 7.2  | 6380        | 6390            |
 | Valkey 8.1  | 6381        | 6391            |
 | Valkey 9.0  | 6382        | 6392            |
 
+### PostgreSQL vs Redis suite (`--profile pg`)
+
+| Target                            | Port | Notes                                        |
+|-----------------------------------|------|----------------------------------------------|
+| Redis 7.4                         | 6379 | Redis baseline                               |
+| PostgreSQL 17 (default)           | 5432 | Out-of-the-box durable, `synchronous_commit=on` |
+| PostgreSQL 17 (sync_commit=off)   | 5433 | Tuning variant, fewer fsync waits            |
+
+The **default** PostgreSQL target is the headline comparison against Redis (what
+you get with no tuning). The **`sync_commit=off`** target is a secondary "what a
+bit of tuning buys you" data point — not the default, and it trades some crash
+durability for throughput.
+
 ## Tests
 
 | Test | Description |
 |------|-------------|
-| **Raw PING** | Baseline Redis round-trip latency |
+| **Raw round-trip** | Baseline latency (`PING` for Redis, `SELECT 1` for PostgreSQL) |
 | **Bulk Insert** | `addBulk()` with 50,000 jobs |
 | **Single Insert** | Concurrent `add()` calls (concurrency=10) |
 | **Pure Overhead** | No-op jobs at c=1, c=10, c=50 |
@@ -119,11 +170,19 @@ Environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `SUITE` | `valkey` | Which suite to run: `valkey` or `pg` (also `--suite=pg`) |
 | `RUNS` | 5 | Runs per test (mean ± stddev) |
 | `BULK_JOBS` | 50000 | Jobs for bulk insert |
-| `PROCESS_JOBS` | 10000 | Jobs for processing tests |
+| `PROCESS_JOBS` | 50000 | Jobs for processing tests |
+| `PG_POOL_MAX` | 64 | node-postgres pool size per backend (`pg` suite) |
+| `PGUSER` / `PGPASSWORD` / `PGDATABASE` | `postgres` / `postgres` / `bullmq_bench` | PostgreSQL credentials (`pg` suite) |
 
 ## Output
 
-Results are printed as a summary table and saved to `results.json`
-(or `results-mt.json` for io-threads mode).
+Results are printed as a summary table and saved to JSON:
+
+| Suite / mode | File |
+|--------------|------|
+| Valkey, single-threaded | `results.json` |
+| Valkey, io-threads | `results-mt.json` |
+| PostgreSQL vs Redis | `results-pg.json` |

@@ -25,17 +25,53 @@
  *   PROCESS_JOBS=50000 Jobs for processing tests
  */
 
-import { Queue, Worker } from "bullmq";
+import { Queue, Worker, createPostgresBackend } from "bullmq";
 
 // ── Configuration ────────────────────────────────────────────────────
 
 const useIOThreads = process.argv.includes("--io-threads");
 
-const TARGETS = [
-  { name: "Valkey 7.2", port: useIOThreads ? 6390 : 6380 },
-  { name: "Valkey 8.1", port: useIOThreads ? 6391 : 6381 },
-  { name: "Valkey 9.0", port: useIOThreads ? 6392 : 6382 },
-];
+// Which suite to run:
+//   valkey (default) — compare Valkey 7.2 / 8.1 / 9.0 over the Redis protocol
+//   pg               — compare the BullMQ v6 PostgreSQL backend against Redis
+const suiteArg = process.argv.find((a) => a.startsWith("--suite="));
+const SUITE = (
+  suiteArg ? suiteArg.split("=")[1] : process.env.SUITE ?? "valkey"
+).toLowerCase();
+
+const PG_USER = process.env.PGUSER ?? "postgres";
+const PG_PASSWORD = process.env.PGPASSWORD ?? "postgres";
+const PG_DB = process.env.PGDATABASE ?? "bullmq_bench";
+const PG_SCHEMA = process.env.PGSCHEMA ?? "bullmq";
+// node-postgres pool size per backend. Must comfortably exceed the highest
+// worker concurrency we test (c=50) so processing is not pool-starved.
+const PG_POOL_MAX = parseInt(process.env.PG_POOL_MAX ?? "64", 10);
+
+const pgUrl = (port) =>
+  `postgres://${PG_USER}:${PG_PASSWORD}@localhost:${port}/${PG_DB}`;
+
+// A "target" abstracts the backend so the benchmark body is identical for
+// Redis and PostgreSQL. `kind` selects how we connect, reset and ping.
+const SUITES = {
+  valkey: [
+    { name: "Valkey 7.2", kind: "redis", port: useIOThreads ? 6390 : 6380 },
+    { name: "Valkey 8.1", kind: "redis", port: useIOThreads ? 6391 : 6381 },
+    { name: "Valkey 9.0", kind: "redis", port: useIOThreads ? 6392 : 6382 },
+  ],
+  pg: [
+    { name: "Redis 7.4", kind: "redis", port: 6379 },
+    { name: "PostgreSQL 17 (default)", kind: "postgres", url: pgUrl(5432) },
+    { name: "PostgreSQL 17 (sync_commit=off)", kind: "postgres", url: pgUrl(5433) },
+  ],
+};
+
+const TARGETS = SUITES[SUITE];
+if (!TARGETS) {
+  console.error(
+    `Unknown suite "${SUITE}". Use --suite=valkey (default) or --suite=pg.`,
+  );
+  process.exit(1);
+}
 
 const RUNS = parseInt(process.env.RUNS ?? "5", 10);
 const BULK_JOBS = parseInt(process.env.BULK_JOBS ?? "50000", 10);
@@ -56,20 +92,94 @@ function fmt(n) {
   return new Intl.NumberFormat("en-US").format(Math.round(n));
 }
 
-function connOpts(port) {
-  return { connection: { host: "localhost", port } };
+function connOpts(target) {
+  if (target.kind === "postgres") {
+    return {
+      connection: {
+        connectionString: target.url,
+        max: target.poolMax ?? PG_POOL_MAX,
+        schema: target.schema ?? PG_SCHEMA,
+      },
+    };
+  }
+  return { connection: { host: "localhost", port: target.port } };
 }
 
-async function flush(port) {
+// Construct a Queue/Worker bound to the target's backend. For PostgreSQL the
+// `createPostgresBackend` factory is passed as the last constructor argument
+// (it lazily loads the `pg` peer dependency only when actually used).
+function makeQueue(target, name) {
+  const opts = connOpts(target);
+  return target.kind === "postgres"
+    ? new Queue(name, opts, createPostgresBackend)
+    : new Queue(name, opts);
+}
+
+function makeWorker(target, name, processor, extra = {}) {
+  const opts = { ...connOpts(target), ...extra };
+  return target.kind === "postgres"
+    ? new Worker(name, processor, opts, createPostgresBackend)
+    : new Worker(name, processor, opts);
+}
+
+// Reset the backend to a clean slate between measurements. For Redis this is a
+// FLUSHALL; for PostgreSQL we TRUNCATE the queue-data tables while preserving
+// the `bullmq_migration` ledger (equivalent to keeping the schema in place, the
+// way FLUSHALL leaves the Redis server itself untouched).
+async function reset(target) {
+  if (target.kind === "postgres") {
+    const { default: pg } = await import("pg");
+    const client = new pg.Client({ connectionString: target.url });
+    await client.connect();
+    const schema = target.schema ?? PG_SCHEMA;
+    try {
+      const { rows } = await client.query(
+        `SELECT tablename FROM pg_tables
+          WHERE schemaname = $1
+            AND tablename LIKE 'bullmq\\_%'
+            AND tablename <> 'bullmq_migration'`,
+        [schema],
+      );
+      if (rows.length) {
+        const tables = rows
+          .map((r) => `"${schema}"."${r.tablename}"`)
+          .join(", ");
+        await client.query(`TRUNCATE ${tables} RESTART IDENTITY CASCADE`);
+      }
+    } finally {
+      await client.end();
+    }
+    return;
+  }
   const { Redis } = await import("ioredis");
-  const r = new Redis({ host: "localhost", port, maxRetriesPerRequest: null });
+  const r = new Redis({
+    host: "localhost",
+    port: target.port,
+    maxRetriesPerRequest: null,
+  });
   await r.flushall();
   await r.quit();
 }
 
-async function pingLatency(port, count = 5000) {
+async function pingLatency(target, count = 5000) {
+  if (target.kind === "postgres") {
+    const { default: pg } = await import("pg");
+    const client = new pg.Client({ connectionString: target.url });
+    await client.connect();
+    const start = performance.now();
+    for (let i = 0; i < count; i++) {
+      await client.query("SELECT 1");
+    }
+    const elapsed = performance.now() - start;
+    await client.end();
+    return elapsed / count; // ms per round-trip
+  }
   const { Redis } = await import("ioredis");
-  const r = new Redis({ host: "localhost", port, maxRetriesPerRequest: null });
+  const r = new Redis({
+    host: "localhost",
+    port: target.port,
+    maxRetriesPerRequest: null,
+  });
   const start = performance.now();
   for (let i = 0; i < count; i++) {
     await r.ping();
@@ -81,9 +191,9 @@ async function pingLatency(port, count = 5000) {
 
 // ── Benchmark: Bulk Insert ───────────────────────────────────────────
 
-async function benchBulkInsert(port, numJobs) {
-  await flush(port);
-  const queue = new Queue("bench-bulk", connOpts(port));
+async function benchBulkInsert(target, numJobs) {
+  await reset(target);
+  const queue = makeQueue(target, "bench-bulk");
 
   const jobs = Array.from({ length: numJobs }, (_, i) => ({
     name: `job-${i}`,
@@ -96,15 +206,15 @@ async function benchBulkInsert(port, numJobs) {
 
   const rate = numJobs / elapsed;
   await queue.close();
-  await flush(port);
+  await reset(target);
   return rate;
 }
 
 // ── Benchmark: Single Insert (concurrent) ────────────────────────────
 
-async function benchSingleInsert(port, numJobs, concurrency = 10) {
-  await flush(port);
-  const queue = new Queue("bench-single", connOpts(port));
+async function benchSingleInsert(target, numJobs, concurrency = 10) {
+  await reset(target);
+  const queue = makeQueue(target, "bench-single");
 
   let idx = 0;
   const start = performance.now();
@@ -123,16 +233,16 @@ async function benchSingleInsert(port, numJobs, concurrency = 10) {
 
   const rate = numJobs / elapsed;
   await queue.close();
-  await flush(port);
+  await reset(target);
   return rate;
 }
 
 // ── Benchmark: Processing ────────────────────────────────────────────
 
-async function benchProcessing(port, numJobs, concurrency, workFn) {
-  await flush(port);
+async function benchProcessing(target, numJobs, concurrency, workFn) {
+  await reset(target);
   const queueName = `bench-proc-${concurrency}-${Date.now()}`;
-  const queue = new Queue(queueName, connOpts(port));
+  const queue = makeQueue(target, queueName);
 
   // Pre-load jobs
   const batchSize = 5000;
@@ -151,13 +261,13 @@ async function benchProcessing(port, numJobs, concurrency, workFn) {
     let completed = 0;
     let startTime;
 
-    const worker = new Worker(
+    const worker = makeWorker(
+      target,
       queueName,
       async (job) => {
         if (workFn) await workFn(job);
       },
       {
-        ...connOpts(port),
         concurrency,
         autorun: false,
       }
@@ -173,7 +283,7 @@ async function benchProcessing(port, numJobs, concurrency, workFn) {
         const rate = numJobs / elapsed;
         worker.close().then(() => {
           queue.close().then(() => {
-            flush(port).then(() => resolve(rate));
+            reset(target).then(() => resolve(rate));
           });
         });
       }
@@ -223,36 +333,43 @@ async function runTest(label, fn, runs = RUNS) {
 // ── Main ─────────────────────────────────────────────────────────────
 
 async function main() {
-  const mode = useIOThreads ? "io-threads=4" : "single-threaded (default)";
+  const mode =
+    SUITE === "pg"
+      ? "PostgreSQL vs Redis"
+      : useIOThreads
+        ? "io-threads=4"
+        : "single-threaded (default)";
   console.log(`\n╔══════════════════════════════════════════════════════╗`);
-  console.log(`║   BullMQ Valkey Benchmark — ${mode.padEnd(24)}║`);
+  console.log(`║   BullMQ Benchmark — ${mode.padEnd(31)}║`);
   console.log(`║   ${RUNS} runs · ${fmt(BULK_JOBS)} bulk · ${fmt(PROCESS_JOBS)} process jobs     ║`);
   console.log(`╚══════════════════════════════════════════════════════╝\n`);
 
   const allResults = {};
 
   for (const target of TARGETS) {
-    console.log(`\n━━━ ${target.name} (port ${target.port}) ━━━\n`);
+    const where =
+      target.kind === "postgres" ? target.url : `port ${target.port}`;
+    console.log(`\n━━━ ${target.name} (${where}) ━━━\n`);
     const results = {};
 
-    // 0. Ping latency
-    console.log("▸ Raw PING latency");
-    const pingMs = await pingLatency(target.port);
-    console.log(`  → ${pingMs.toFixed(3)} ms/ping\n`);
+    // 0. Round-trip latency (PING for Redis, SELECT 1 for PostgreSQL)
+    console.log("▸ Raw round-trip latency");
+    const pingMs = await pingLatency(target);
+    console.log(`  → ${pingMs.toFixed(3)} ms/round-trip\n`);
     results.ping = pingMs;
 
     // 1. Bulk insert
     console.log("▸ Bulk Insert");
     results.bulkInsert = await runTest(
       "Bulk Insert",
-      () => benchBulkInsert(target.port, BULK_JOBS)
+      () => benchBulkInsert(target, BULK_JOBS)
     );
 
     // 2. Single insert
     console.log("▸ Single Insert (concurrency=10)");
     results.singleInsert = await runTest(
       "Single Insert",
-      () => benchSingleInsert(target.port, 5000, 10)
+      () => benchSingleInsert(target, 5000, 10)
     );
 
     // 3. Pure overhead
@@ -260,7 +377,7 @@ async function main() {
       console.log(`▸ Pure Overhead (c=${c})`);
       results[`overhead_c${c}`] = await runTest(
         `Overhead c=${c}`,
-        () => benchProcessing(target.port, PROCESS_JOBS, c, null)
+        () => benchProcessing(target, PROCESS_JOBS, c, null)
       );
     }
 
@@ -269,7 +386,7 @@ async function main() {
       console.log(`▸ 10ms I/O Work (c=${c})`);
       results[`io_c${c}`] = await runTest(
         `I/O c=${c}`,
-        () => benchProcessing(target.port, Math.min(PROCESS_JOBS, 5000), c, ioWork)
+        () => benchProcessing(target, Math.min(PROCESS_JOBS, 5000), c, ioWork)
       );
     }
 
@@ -277,7 +394,7 @@ async function main() {
     console.log("▸ CPU Work — 1000 sin/cos (c=10)");
     results.cpu_c10 = await runTest(
       "CPU c=10",
-      () => benchProcessing(target.port, PROCESS_JOBS, 10, cpuWork)
+      () => benchProcessing(target, PROCESS_JOBS, 10, cpuWork)
     );
 
     allResults[target.name] = results;
@@ -303,7 +420,7 @@ async function main() {
 
   // Header
   const col1 = 20;
-  const colW = 18;
+  const colW = Math.max(18, ...TARGETS.map((t) => t.name.length + 2));
   let header = "Test".padEnd(col1);
   for (const t of TARGETS) header += t.name.padStart(colW);
   console.log(header);
@@ -335,7 +452,8 @@ async function main() {
     };
   }
 
-  const jsonPath = `results${useIOThreads ? "-mt" : ""}.json`;
+  const suffix = SUITE === "pg" ? "-pg" : useIOThreads ? "-mt" : "";
+  const jsonPath = `results${suffix}.json`;
   const fs = await import("fs");
   fs.writeFileSync(jsonPath, JSON.stringify(jsonOut, null, 2));
   console.log(`\nResults saved to ${jsonPath}`);

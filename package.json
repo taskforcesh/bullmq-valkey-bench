@@ -1,14 +1,16 @@
 {
   "name": "bullmq-valkey-bench",
   "version": "1.0.0",
-  "description": "Benchmark BullMQ across Valkey 7.2, 8.1, and 9.0",
+  "description": "Benchmark BullMQ across Valkey 7.2/8.1/9.0 and the v6 PostgreSQL backend vs Redis",
   "type": "module",
   "scripts": {
     "bench": "node bench.js",
-    "bench:mt": "node bench.js --io-threads"
+    "bench:mt": "node bench.js --io-threads",
+    "bench:pg": "node bench.js --suite=pg"
   },
   "dependencies": {
-    "bullmq": "^5.67.0",
-    "ioredis": "^5.0.0"
+    "bullmq": "^6.0.0",
+    "ioredis": "^5.0.0",
+    "pg": "^8.13.0"
   }
 }

@@ -126,3 +126,77 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  # ── PostgreSQL vs Redis suite (BullMQ v6) ───────────────────────────
+  # Activate with: docker compose --profile pg up -d --wait
+  # Then run:      SUITE=pg node bench.js
+  #
+  # Three targets on their own ports:
+  #   redis          6379  — Redis baseline
+  #   postgres       5432  — PostgreSQL, durable defaults (synchronous_commit=on)
+  #   postgres-fast  5433  — PostgreSQL, synchronous_commit=off (throughput tuning)
+
+  # ── Redis baseline ──────────────────────────────────────────────────
+  redis:
+    image: redis:7.4
+    container_name: redis
+    profiles: ["pg"]
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --save ""
+      --appendonly no
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── PostgreSQL — durable defaults (synchronous_commit=on) ───────────
+  postgres:
+    image: postgres:17
+    container_name: postgres
+    profiles: ["pg"]
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: bullmq_bench
+    # Tuning kept modest and identical to the "fast" variant so the only
+    # difference between the two Postgres targets is synchronous_commit.
+    command: >
+      postgres
+      -c max_connections=200
+      -c shared_buffers=512MB
+      -c synchronous_commit=on
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d bullmq_bench"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── PostgreSQL — synchronous_commit=off (fewer fsync waits) ─────────
+  postgres-fast:
+    image: postgres:17
+    container_name: postgres-fast
+    profiles: ["pg"]
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: bullmq_bench
+    command: >
+      postgres
+      -c max_connections=200
+      -c shared_buffers=512MB
+      -c synchronous_commit=off
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d bullmq_bench"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
